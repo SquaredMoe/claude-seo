@@ -69,13 +69,29 @@ _REQUIRED_SHIPPING_FIELDS = (
 )
 
 
+def _node_types(payload: dict) -> list[str]:
+    """Normalize Schema.org type IRIs without conflating other vocabularies."""
+    kinds = payload.get("@type", [])
+    if isinstance(kinds, str):
+        kinds = [kinds]
+    if not isinstance(kinds, list):
+        return []
+    names = []
+    for kind in kinds:
+        if not isinstance(kind, str):
+            continue
+        for namespace in ("https://schema.org/", "http://schema.org/"):
+            if kind.startswith(namespace):
+                kind = kind[len(namespace):]
+                break
+        names.append(kind)
+    return names
+
+
 def _iter_typed(payload, target_type: str):
     """Yield every dict in ``payload`` whose @type matches ``target_type``."""
     if isinstance(payload, dict):
-        kind = payload.get("@type")
-        if isinstance(kind, str) and kind == target_type:
-            yield payload
-        elif isinstance(kind, list) and target_type in kind:
+        if _has_type(payload, target_type):
             yield payload
         for v in payload.values():
             yield from _iter_typed(v, target_type)
@@ -87,11 +103,7 @@ def _iter_typed(payload, target_type: str):
 def _all_types(payload) -> list[str]:
     types: list[str] = []
     if isinstance(payload, dict):
-        kind = payload.get("@type")
-        if isinstance(kind, str):
-            types.append(kind)
-        elif isinstance(kind, list):
-            types.extend(t for t in kind if isinstance(t, str))
+        types.extend(_node_types(payload))
         for v in payload.values():
             types.extend(_all_types(v))
     elif isinstance(payload, list):
@@ -117,12 +129,7 @@ def _has_loyalty_price(offer: dict) -> bool:
 
 
 def _has_type(payload: dict, target_type: str) -> bool:
-    kind = payload.get("@type")
-    if isinstance(kind, str):
-        return kind == target_type
-    if isinstance(kind, list):
-        return target_type in kind
-    return False
+    return target_type in _node_types(payload)
 
 
 def validate(payload: dict | list, *, require_eu_energy: bool = False) -> dict:
@@ -171,7 +178,9 @@ def validate(payload: dict | list, *, require_eu_energy: bool = False) -> dict:
         elif isinstance(offers, list):
             offers_list = offers
         else:
-            offers_list = []
+            # Keep invalid scalar values so the same shape check used for
+            # list entries reports them instead of silently passing.
+            offers_list = [offers]
 
         for offer in offers_list:
             if not isinstance(offer, dict):
@@ -218,14 +227,15 @@ def validate(payload: dict | list, *, require_eu_energy: bool = False) -> dict:
                 "message": "Product (or its Offer) is missing "
                            "hasMerchantReturnPolicy.",
             })
-        elif isinstance(return_policy, dict):
-            for field in _REQUIRED_RETURN_POLICY_FIELDS:
-                if field not in return_policy:
-                    findings.append({
-                        "severity": "Medium",
-                        "rule": f"return-policy-{field}",
-                        "message": f"MerchantReturnPolicy is missing {field!r}.",
-                    })
+        else:
+            for policy in _as_dicts(return_policy):
+                for field in _REQUIRED_RETURN_POLICY_FIELDS:
+                    if field not in policy:
+                        findings.append({
+                            "severity": "Medium",
+                            "rule": f"return-policy-{field}",
+                            "message": f"MerchantReturnPolicy is missing {field!r}.",
+                        })
 
         # 5. shippingDetails (recommended or conditional).
         shipping = prod.get("shippingDetails") or first_offer.get("shippingDetails")
@@ -236,14 +246,15 @@ def validate(payload: dict | list, *, require_eu_energy: bool = False) -> dict:
                 "message": "Product (or its Offer) is missing "
                            "shippingDetails.",
             })
-        elif isinstance(shipping, dict):
-            for field in _REQUIRED_SHIPPING_FIELDS:
-                if field not in shipping:
-                    findings.append({
-                        "severity": "Medium",
-                        "rule": f"shipping-{field}",
-                        "message": f"OfferShippingDetails is missing {field!r}.",
-                    })
+        else:
+            for details in _as_dicts(shipping):
+                for field in _REQUIRED_SHIPPING_FIELDS:
+                    if field not in details:
+                        findings.append({
+                            "severity": "Medium",
+                            "rule": f"shipping-{field}",
+                            "message": f"OfferShippingDetails is missing {field!r}.",
+                        })
 
         # 6. Loyalty / MemberProgram visibility (Medium).
         if not prod.get("hasMemberProgram") and not any(

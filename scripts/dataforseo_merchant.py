@@ -29,6 +29,8 @@ SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 if SCRIPT_DIR not in sys.path:
     sys.path.insert(0, SCRIPT_DIR)
 
+from dataforseo_normalize import _normalize_availability, normalize_merchant  # noqa: E402
+
 try:
     import requests
 except ImportError:
@@ -213,35 +215,20 @@ def _normalize_price(raw_price: Any) -> Optional[float]:
     return None
 
 
-def _normalize_availability(raw: Any) -> str:
-    """Normalize availability to enum."""
-    if not raw:
-        return "unknown"
-    text = str(raw).lower().strip()
-    if "in_stock" in text or "in stock" in text:
-        return "in_stock"
-    if "out_of_stock" in text or "out of stock" in text:
-        return "out_of_stock"
-    if "preorder" in text or "pre-order" in text or "pre_order" in text:
-        return "preorder"
-    return "unknown"
-
-
 def _normalize_product(item: dict[str, Any], marketplace: str) -> dict[str, Any]:
     """Normalize a single product item."""
+    normalized = normalize_merchant([item])[0]
     return {
         "marketplace": marketplace,
         "title": item.get("title", ""),
-        "price": _normalize_price(item.get("price")),
-        "currency": item.get("currency", "USD"),
+        "price": normalized["price"],
+        "currency": normalized["currency"],
         "seller": item.get("seller", item.get("seller_name", "")),
-        "rating": round(float(item.get("rating", {}).get("value", 0) or 0), 1)
-            if isinstance(item.get("rating"), dict)
-            else round(float(item.get("rating", 0) or 0), 1),
-        "reviews_count": int(item.get("reviews_count", 0) or 0),
+        "rating": normalized["rating"],
+        "reviews_count": normalized["reviews_count"],
         "url": item.get("url", ""),
         "image_url": item.get("image_url", item.get("marketplace_url", "")),
-        "availability": _normalize_availability(item.get("availability")),
+        "availability": _normalize_availability(item.get("availability") or item.get("product_availability")),
     }
 
 
@@ -254,6 +241,8 @@ def _normalize_seller(item: dict[str, Any]) -> dict[str, Any]:
         "price": _normalize_price(item.get("price")),
         "delivery_info": item.get("delivery_info", ""),
         "url": item.get("url", ""),
+        # Sellers items carry the native product_availability field.
+        "availability": _normalize_availability(item.get("availability") or item.get("product_availability")),
     }
 
 

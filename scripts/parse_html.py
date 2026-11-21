@@ -61,7 +61,9 @@ import copy
 import json
 import os
 import re
+import stat
 import sys
+import time
 from typing import Any, Optional
 from urllib.parse import urldefrag, urljoin, urlparse
 
@@ -83,11 +85,18 @@ if _SCRIPTS_DIR not in sys.path:
     sys.path.insert(0, _SCRIPTS_DIR)
 import requests  # noqa: E402  (url_safety already hard-requires it)
 from url_safety import (  # noqa: E402, I001
+    MAX_PAGE_BYTES,
     URLSafetyError,
-    decode_response_text,
+    decode_body,
     json_depth_exceeds,
+    read_bounded_until,
     safe_requests_get,
 )
+
+# Wall-clock budget in seconds for the whole --url fetch. The 30 second
+# timeout only limits each read, so a server that drips bytes could hold the
+# fetch for hours. Same budget as fetch_page.py at its default timeout.
+URL_FETCH_MAX_SECONDS = 60.0
 
 # Lazy-loader detection: covers native + the major JS lazy-loaders found on
 # WordPress/WooCommerce sites (Perfmatters, EWWW Image Optimizer, generic
@@ -801,6 +810,11 @@ def parse_html(html: str, base_url: Optional[str] = None) -> dict:
                 result.setdefault("malformed_urls", []).append({"tag": "a", "value": href})
                 continue
 
+            # Contact/action links are not crawlable pages. Check the parsed
+            # scheme so case and leading whitespace cannot bypass this filter.
+            if parsed.scheme.lower() not in {"http", "https"}:
+                continue
+
             link_data = {
                 "href": full_url,
                 "text": _element_text(a)[:100],
@@ -829,7 +843,12 @@ def parse_html(html: str, base_url: Optional[str] = None) -> dict:
             # own, but its @context is inherited by the entries it holds.
             if isinstance(schema_data, dict) and "@graph" in schema_data:
                 inherited_context = schema_data.get("@context")
-                for item in schema_data["@graph"]:
+                graph = schema_data["@graph"]
+                if isinstance(graph, dict):
+                    graph = [graph]
+                elif not isinstance(graph, list):
+                    raise ValueError("@graph must be an object or list")
+                for item in graph:
                     if isinstance(item, dict):
                         result["schema"].append(_inherit_context(item, inherited_context))
             elif isinstance(schema_data, list):
@@ -867,6 +886,34 @@ def parse_html(html: str, base_url: Optional[str] = None) -> dict:
     return result
 
 
+def _stdin_has_piped_input() -> bool:
+    """Return True when stdin is a pipe or a regular file.
+
+    With ``--url`` and no file, stdin is only worth reading when something
+    was piped or redirected into it. An inherited socket (as in the Claude
+    desktop app) or a terminal stays open without ever being written, so a
+    blind ``sys.stdin.read()`` blocks forever; ``isatty()`` alone does not
+    catch the socket case.
+    """
+    if sys.stdin is None:
+        return False
+    try:
+        fd = sys.stdin.fileno()
+    except (AttributeError, OSError, ValueError):
+        # A replaced in-memory stdin (tests, embedding) has no descriptor
+        # and cannot block, so it is safe to read.
+        return True
+    try:
+        mode = os.fstat(fd).st_mode
+    except OSError:
+        return False
+    return stat.S_ISFIFO(mode) or stat.S_ISREG(mode)
+
+
+def _looks_like_url(value: str) -> bool:
+    return value.lower().startswith(("http://", "https://"))
+
+
 def main():
     parser = argparse.ArgumentParser(description="Parse HTML for SEO analysis")
     parser.add_argument("file", nargs="?", help="HTML file to parse")
@@ -883,15 +930,50 @@ def main():
     if args.file:
         real_path = os.path.realpath(args.file)
         if not os.path.isfile(real_path):
-            print(f"Error: File not found: {args.file}", file=sys.stderr)
+            if _looks_like_url(args.file):
+                print(
+                    f"Error: {args.file} looks like a URL, not an HTML file; "
+                    f"pass it with --url: parse_html.py --url {args.file}",
+                    file=sys.stderr,
+                )
+            else:
+                print(f"Error: File not found: {args.file}", file=sys.stderr)
             sys.exit(1)
         with open(real_path, "r", encoding="utf-8") as f:
             html = f.read()
     else:
-        html = sys.stdin.read()
+        # With --url, read stdin only when something was piped or redirected
+        # in; an open but silent stdin (socket, terminal) would block forever.
+        if args.url and not _stdin_has_piped_input():
+            html = ""
+        else:
+            html = sys.stdin.read()
         if not html and args.url:
-            resp = safe_requests_get(args.url, timeout=30, allow_redirects=True)
-            html = decode_response_text(resp)
+            deadline = time.monotonic() + URL_FETCH_MAX_SECONDS
+            resp = safe_requests_get(
+                args.url, timeout=30, allow_redirects=True, stream=True
+            )
+            # Streamed so the body is read under the cap and the deadline;
+            # .content must not be read after this.
+            try:
+                raw, too_large, timed_out = read_bounded_until(
+                    resp, MAX_PAGE_BYTES, deadline
+                )
+            finally:
+                resp.close()
+            if timed_out:
+                print(
+                    f"Warning: page fetch exceeded {URL_FETCH_MAX_SECONDS:g} "
+                    "seconds; parsing the part read before the deadline.",
+                    file=sys.stderr,
+                )
+            if too_large:
+                print(
+                    f"Warning: page body exceeded {MAX_PAGE_BYTES} bytes; "
+                    "parsing the part read before the cap.",
+                    file=sys.stderr,
+                )
+            html = decode_body(raw, resp.headers.get("Content-Type", ""))
             args.url = resp.url
 
     result = parse_html(html, args.url)

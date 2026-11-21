@@ -2,10 +2,16 @@
 """
 Capture screenshots of web pages using Playwright.
 
-In v2.0.0 the SSRF pre-flight check is delegated to url_safety, and a
-Playwright route() handler aborts any subresource request whose hostname
-resolves to a non-public IP (defence in depth against DNS rebinding
-inside Chromium's resolver).
+The SSRF pre-flight check is delegated to url_safety. Chromium is launched
+through browser_proxy.guarded_chromium: sandboxed where the host can start
+the Chromium sandbox ("sandbox" in the result says so), with every connection
+(redirect hops included) forced through a local proxy that validates and
+pins the destination. A Playwright route() handler also aborts any request
+whose hostname resolves to a non-public IP (defence in depth). Where the
+sandbox cannot start (Ubuntu 23.10 and later, most containers, root) the
+browser runs without it, with a warning on stderr and "sandbox": false.
+CLAUDE_SEO_CHROMIUM_REQUIRE_SANDBOX=1 makes that an error;
+CLAUDE_SEO_CHROMIUM_NO_SANDBOX=1 skips the sandbox attempt.
 
 Full-page captures (--full) get two hygiene steps before the picture is
 taken, both bounded so a page cannot hang the capture:
@@ -92,6 +98,12 @@ except ImportError:
 _SCRIPTS_DIR = os.path.dirname(os.path.abspath(__file__))
 if _SCRIPTS_DIR not in sys.path:
     sys.path.insert(0, _SCRIPTS_DIR)
+from browser_proxy import (  # noqa: E402
+    PageNotLoadedError,
+    chromium_sandboxed,
+    guarded_chromium,
+    require_public_page,
+)
 from url_safety import (  # noqa: E402  (sys.path massage above is intentional)
     URLSafetyError,
     make_safe_playwright_route_handler,
@@ -430,6 +442,9 @@ def capture_screenshot(
         "output": output_path,
         "viewport": viewport,
         "success": False,
+        # True or False once a browser was launched (False: no Chromium
+        # sandbox on this system); None when none was.
+        "sandbox": None,
         "error": None,
         "full_page": full_page,
         "scroll_through": None,
@@ -464,8 +479,8 @@ def capture_screenshot(
     loaded = False
 
     try:
-        with sync_playwright() as p:
-            browser = p.chromium.launch(headless=True)
+        with sync_playwright() as p, guarded_chromium(p.chromium, url) as browser:
+            result["sandbox"] = chromium_sandboxed(browser)
             context = new_guarded_context(
                 browser,
                 route_handler,
@@ -480,6 +495,9 @@ def capture_screenshot(
 
             # Navigate and wait for network idle
             page.goto(url, wait_until="networkidle", timeout=timeout)
+            # A blank or error page, or one reached through a refused
+            # redirect, is an error result below, never a screenshot.
+            require_public_page(page)
             loaded = True
 
             # Wait a bit more for any lazy-loaded content
@@ -503,11 +521,14 @@ def capture_screenshot(
             elif hide_overlays:
                 result.update(_hide_overlays(page))
 
+            # Page scripts may have navigated since the load; check again
+            # so the picture is never of a refused or failed document.
+            require_public_page(page)
+
             # Capture screenshot
             page.screenshot(path=output_path, full_page=full_page)
 
             result["success"] = True
-            browser.close()
 
     except PlaywrightTimeout:
         # After the load, only the screenshot can time out here: the page-side
@@ -516,6 +537,10 @@ def capture_screenshot(
             result["error"] = "Screenshot timed out: the page did not answer in time"
         else:
             result["error"] = f"Page load timed out after {timeout}ms"
+    except URLSafetyError as e:
+        result["error"] = f"url_safety: {e}"
+    except PageNotLoadedError as e:
+        result["error"] = f"Page did not load: {e}"
     except Exception as e:
         result["error"] = str(e)
 

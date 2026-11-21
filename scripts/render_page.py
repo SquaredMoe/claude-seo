@@ -50,6 +50,9 @@ A dict with::
     js_gap            raw-versus-rendered difference (see below), or None
                       when no render happened (or the HTML was too large
                       to compare, which render_diagnostics then says)
+    sandbox           True when Chromium ran with its sandbox, False when
+                      it ran without (unavailable on this system, root, or
+                      opted out), None when no browser was launched
     error             str or None
 
 JavaScript content gap
@@ -82,11 +85,18 @@ these limits keep the whole object to about 24,000 characters of JSON.
 SSRF
 ====
 The URL is validated via :func:`url_safety.validate_url_strict` before
-Playwright sees it. Inside Playwright a ``route()`` handler intercepts
-every subresource and aborts requests whose hostname resolves to a
-non-public IP. This is defence in depth against DNS rebinding inside
-Chromium's resolver. The residual rebinding risk for browser fetches
-is documented in SECURITY.md.
+Playwright sees it. Chromium is launched through
+:func:`browser_proxy.guarded_chromium`: sandboxed where the host can start
+the Chromium sandbox (``sandbox`` in the result says so), with every connection
+(redirect hops included) forced through a local proxy that validates and
+pins the destination. A ``route()`` handler also aborts requests whose
+hostname resolves to a non-public IP, as defence in depth. A render that
+ends on a blank, failed or refused page is an error with the raw fetch
+kept (``raw_fallback_available``). The limits are documented in
+SECURITY.md. Where the sandbox cannot start (Ubuntu 23.10 and later, most
+containers, root) the browser runs without it, with a warning on stderr and
+``sandbox: false``; ``CLAUDE_SEO_CHROMIUM_REQUIRE_SANDBOX=1`` makes that an
+error and ``CLAUDE_SEO_CHROMIUM_NO_SANDBOX=1`` skips the sandbox attempt.
 
 CLI
 ===
@@ -135,6 +145,12 @@ except ImportError:  # pragma: no cover
 _SCRIPTS_DIR = os.path.dirname(os.path.abspath(__file__))
 if _SCRIPTS_DIR not in sys.path:
     sys.path.insert(0, _SCRIPTS_DIR)
+from browser_proxy import (  # noqa: E402
+    PageNotLoadedError,
+    chromium_sandboxed,
+    guarded_chromium,
+    require_public_page,
+)
 from url_safety import (  # noqa: E402  (sys.path massage above is intentional)
     MAX_PAGE_BYTES,
     URLSafetyError,
@@ -705,6 +721,9 @@ def render_page(
         "mode_used": None,
         "too_large": False,
         "js_gap": None,
+        # True or False once a browser was launched (False: no Chromium
+        # sandbox on this system); None when nothing was rendered.
+        "sandbox": None,
         "error": None,
     }
 
@@ -783,8 +802,8 @@ def render_page(
         start = time.monotonic()
 
         try:
-            with sync_playwright() as p:
-                browser = p.chromium.launch(headless=True)
+            with sync_playwright() as p, guarded_chromium(p.chromium, norm_url) as browser:
+                result["sandbox"] = chromium_sandboxed(browser)
                 context = new_guarded_context(
                     browser,
                     route_handler,
@@ -817,6 +836,11 @@ def render_page(
                         "captured the available DOM"
                     )
 
+                # Raises when the browser holds no public document: a blank
+                # or error page (PageNotLoadedError) or a page reached through
+                # a refused redirect (URLSafetyError). Neither is reported as
+                # the rendered site; the raw fetch stays available.
+                require_public_page(page)
                 result["url"] = page.url
                 result["content"] = page.content()
                 result["status_code"] = response.status if response else raw_status
@@ -850,7 +874,14 @@ def render_page(
                             result["accessibility_error"]
                         )
 
-                browser.close()
+        except URLSafetyError as exc:
+            result["error"] = f"url_safety: {exc}"
+            _keep_raw_on_render_failure()
+            return result
+        except PageNotLoadedError as exc:
+            result["error"] = f"render failed: {exc}"
+            _keep_raw_on_render_failure()
+            return result
         except Exception as exc:
             result["error"] = f"playwright error: {exc}"
             _keep_raw_on_render_failure()

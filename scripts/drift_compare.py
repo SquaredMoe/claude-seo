@@ -159,9 +159,9 @@ def rule_01_schema_removed(baseline: dict, current: dict) -> dict:
 
 def rule_02_canonical_changed(baseline: dict, current: dict) -> dict:
     """CRITICAL: Canonical URL changed."""
-    old = baseline.get("canonical")
-    new = current.get("canonical")
-    triggered = old is not None and new is not None and old != new
+    old = (baseline.get("canonical") or "").strip()
+    new = (current.get("canonical") or "").strip()
+    triggered = bool(old) and bool(new) and old != new
     return _make_finding(
         "canonical_changed", "CRITICAL", triggered,
         old, new,
@@ -172,9 +172,9 @@ def rule_02_canonical_changed(baseline: dict, current: dict) -> dict:
 
 def rule_03_canonical_removed(baseline: dict, current: dict) -> dict:
     """CRITICAL: Canonical URL removed."""
-    old = baseline.get("canonical")
-    new = current.get("canonical")
-    triggered = old is not None and (new is None or new == "")
+    old = (baseline.get("canonical") or "").strip()
+    new = (current.get("canonical") or "").strip()
+    triggered = bool(old) and not new
     return _make_finding(
         "canonical_removed", "CRITICAL", triggered,
         old, None,
@@ -281,13 +281,16 @@ def rule_10_meta_description_changed(baseline: dict, current: dict) -> dict:
     """WARNING: Meta description changed."""
     old = (baseline.get("meta_description") or "").strip()
     new = (current.get("meta_description") or "").strip()
-    triggered = old != "" and new != "" and old != new
+    triggered = bool(old) and old != new
+    message = (
+        "Meta description has changed. Verify it includes target keywords and CTA."
+        if new else "Meta description has been removed. Restore it if the removal was unintentional."
+    )
     return _make_finding(
         "meta_description_changed", "WARNING", triggered,
         old[:120] + ("..." if len(old) > 120 else ""),
         new[:120] + ("..." if len(new) > 120 else ""),
-        "Meta description has changed. Verify it includes target keywords and CTA."
-        if triggered else "Meta description unchanged.",
+        message if triggered else "Meta description unchanged.",
     )
 
 
@@ -303,20 +306,35 @@ def rule_11_cwv_regressed(baseline: dict, current_cwv: dict | None) -> dict:
     if not old_field or not new_field:
         return _make_finding("cwv_regressed", "WARNING", False, None, None, "CWV field comparison skipped (field data unavailable).")
 
+    compared = {}
     for metric_id, label in _FIELD_CWV_METRICS:
-        old_val = _field_p75(old_field, metric_id)
-        new_val = _field_p75(new_field, metric_id)
+        # URL and origin percentiles describe different populations. Prefer
+        # URL data only when it exists on both sides, then a shared fallback.
+        for key in (f"url_{metric_id}", f"origin_{metric_id}", metric_id):
+            old_val = _field_p75({key: old_field.get(key)}, metric_id)
+            new_val = _field_p75({key: new_field.get(key)}, metric_id)
+            if old_val is not None and new_val is not None:
+                compared[metric_id] = (old_val, new_val)
+                break
+        else:
+            continue
         if old_val is not None and new_val is not None and old_val > 0:
             pct_change = (new_val - old_val) / old_val
             if pct_change > 0.20:  # >20% worse (higher is worse for all these)
                 fmt = ".3f" if metric_id == "cumulative_layout_shift" else ".0f"
                 regressions.append(f"{label}: {old_val:{fmt}} -> {new_val:{fmt}} (+{pct_change:.0%})")
 
+    if not compared:
+        return _make_finding(
+            "cwv_regressed", "WARNING", False, None, None,
+            "CWV field comparison skipped (no matching URL/origin scope).",
+        )
+
     triggered = len(regressions) > 0
     return _make_finding(
         "cwv_regressed", "WARNING", triggered,
-        {k: _field_p75(old_field, k) for k, _ in _FIELD_CWV_METRICS} if old_field else None,
-        {k: _field_p75(new_field, k) for k, _ in _FIELD_CWV_METRICS} if new_field else None,
+        {k: pair[0] for k, pair in compared.items()},
+        {k: pair[1] for k, pair in compared.items()},
         f"CWV regressions detected: {'; '.join(regressions)}"
         if triggered else "No significant CWV regressions.",
     )

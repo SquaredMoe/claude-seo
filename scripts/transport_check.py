@@ -27,7 +27,7 @@ Result JSON::
       "host": "<normalized host>",
       "tls": {
         "host", "port", "connected_ip",
-        "verified": <bool>,            # system trust store and hostname
+        "verified": <bool>,            # trusted roots (below) and hostname
         "verify_error": <str|null>,    # OpenSSL text when verified is false
         "verify_code": <int|null>,
         "certificate_read": <bool>,
@@ -93,6 +93,11 @@ can say why (expired, wrong host); no data is sent on it either. Header and
 redirect checks go through ``url_safety.safe_requests_get`` only. When a proxy
 environment variable is set, the raw socket would bypass the proxy, so the
 TLS section is skipped.
+
+Trusted roots: the certificate is verified against Python's default context
+(the system trust store) plus certifi's CA bundle when certifi is importable.
+certifi comes with ``requests``. The extra bundle matters on Windows, where
+Python sees only the roots already present in the local store.
 
 Exit status::
 
@@ -375,6 +380,24 @@ def _pinned_address(value) -> str:
     return str(ipaddress.ip_address(str(value).strip().strip("[]")))
 
 
+def _load_certifi_roots(context: ssl.SSLContext) -> bool:
+    """Add certifi's CA bundle to ``context`` when certifi is installed.
+
+    On Windows, Python sees only the roots already present in the local
+    certificate store; Windows downloads the others on demand for its own
+    TLS stack, not for OpenSSL. A valid chain to a root that has not been
+    fetched yet then fails here while it works in every browser (#421). The
+    default context is kept and certifi's roots are added to it. A missing
+    or unreadable bundle is never an error: the system store still applies.
+    """
+    try:
+        import certifi
+        context.load_verify_locations(certifi.where())
+    except Exception:  # optional extra roots must never break the probe
+        return False
+    return True
+
+
 def _handshake(ip: str, port: int, server_hostname: str, timeout: float, *, verify: bool) -> dict:
     """One TLS handshake to ``ip``. Sends and reads nothing after it.
 
@@ -391,6 +414,7 @@ def _handshake(ip: str, port: int, server_hostname: str, timeout: float, *, veri
     context = ssl.create_default_context()
     context.minimum_version = ssl.TLSVersion.TLSv1_2
     if verify:
+        _load_certifi_roots(context)
         if getattr(ssl, "HAS_NEVER_CHECK_COMMON_NAME", False):
             # Browsers match subjectAltName only; do the same.
             context.hostname_checks_common_name = False
@@ -401,7 +425,9 @@ def _handshake(ip: str, port: int, server_hostname: str, timeout: float, *, veri
     raw = socket.create_connection((ip, port), timeout=timeout)
     tls = None
     try:
-        raw.settimeout(max(0.1, deadline - time.monotonic()))
+        # Never above the requested timeout: (now + timeout) - now can come
+        # out a few ulps over it when the clock has not ticked in between.
+        raw.settimeout(min(timeout, max(0.1, deadline - time.monotonic())))
         tls = context.wrap_socket(raw, server_hostname=server_hostname)
         cipher = tls.cipher() or (None, None, None)
         return {
@@ -567,8 +593,14 @@ def _grade_hsts(raw: Optional[str], https: bool) -> dict:
     # Browsers act on the first header only (RFC 6797); requests joins repeats with commas.
     for part in raw.split(",")[0].split(";"):
         key, _sep, value = part.strip().partition("=")
-        if key.strip():
-            directives.setdefault(key.strip().lower(), value.strip().strip('"'))
+        key = key.strip().lower()
+        if key in directives:
+            message = "Duplicate HSTS directives invalidate the header, so browsers ignore it."
+            hsts["issues"].append(message)
+            hsts["preload_gaps"].append(message)
+            return hsts
+        if key:
+            directives[key] = value.strip().strip('"')
     max_age = directives.get("max-age", "")
     hsts["max_age"] = int(max_age) if max_age.isascii() and max_age.isdigit() else None
     hsts["include_subdomains"] = "includesubdomains" in directives
@@ -604,17 +636,24 @@ def _csp_issues(directives: dict[str, list[str]]) -> list[str]:
     issues = []
     script_name = next((n for n in ("script-src", "default-src") if n in directives), None)
     if script_name is None:
-        issues.append("No script-src or default-src, so scripts are unrestricted.")
-    else:
-        sources = directives[script_name]
+        issues.append("No script-src or default-src, so script uses without a specific override are unrestricted.")
+    elif "'unsafe-eval'" in directives[script_name]:
+        # Element and attribute directives do not govern eval().
+        issues.append(f"'unsafe-eval' in {script_name}.")
+
+    element_name = "script-src-elem" if "script-src-elem" in directives else script_name
+    attribute_name = "script-src-attr" if "script-src-attr" in directives else script_name
+    for name in dict.fromkeys((element_name, attribute_name)):
+        if name is None:
+            continue
+        sources = directives[name]
         strict = any(s.startswith(("'nonce-", "'sha256-", "'sha384-", "'sha512-")) for s in sources)
         if "'unsafe-inline'" in sources and not strict:
-            issues.append(f"'unsafe-inline' in {script_name}.")
-        if "'unsafe-eval'" in sources:
-            issues.append(f"'unsafe-eval' in {script_name}.")
-        for loose in ("*", "https:", "http:", "data:"):
-            if loose in sources:
-                issues.append(f"{loose} in {script_name} allows scripts from almost anywhere.")
+            issues.append(f"'unsafe-inline' in {name}.")
+        if name == element_name:
+            for loose in ("*", "https:", "http:", "data:"):
+                if loose in sources:
+                    issues.append(f"{loose} in {name} allows scripts from almost anywhere.")
     if "object-src" not in directives and directives.get("default-src") != ["'none'"]:
         issues.append("No object-src restriction.")
     if "base-uri" not in directives:
@@ -626,6 +665,15 @@ _REFERRER_POLICIES = frozenset({
     "no-referrer", "no-referrer-when-downgrade", "origin", "origin-when-cross-origin",
     "same-origin", "strict-origin", "strict-origin-when-cross-origin", "unsafe-url",
 })
+
+
+def _restricts_frame_ancestors(sources: list[str]) -> bool:
+    """An empty list blocks all ancestors; broad web sources do not protect."""
+    return not any(
+        source in {"http:", "https:"}
+        or re.fullmatch(r"(?:https?://)?\*(?::(?:\*|\d+))?/?", source)
+        for source in sources
+    )
 
 
 def analyze_headers(headers: Optional[dict], set_cookies: Optional[list[str]] = None,
@@ -659,7 +707,15 @@ def analyze_headers(headers: Optional[dict], set_cookies: Optional[list[str]] = 
     nosniff = low.get("x-content-type-options")
     xfo = low.get("x-frame-options")
     xfo_ok = xfo is not None and xfo.strip().upper() in ("DENY", "SAMEORIGIN")
-    frame_ancestors = enforced is not None and "frame-ancestors" in directives
+    # Enforced frame-ancestors overrides X-Frame-Options. Every CSP is
+    # enforced, so any restrictive ancestor list is enough to limit framing.
+    ancestor_lists = []
+    for value in (enforced or "").split(","):
+        parsed = _parse_csp(value)
+        if "frame-ancestors" in parsed:
+            ancestor_lists.append(parsed["frame-ancestors"])
+    frame_ancestors = bool(ancestor_lists)
+    framing_ok = any(_restricts_frame_ancestors(s) for s in ancestor_lists) if frame_ancestors else xfo_ok
 
     referrer = low.get("referrer-policy")
     known = [t.strip().lower() for t in (referrer or "").split(",")
@@ -673,7 +729,7 @@ def analyze_headers(headers: Optional[dict], set_cookies: Optional[list[str]] = 
             "present": nosniff is not None, "value": _clip(nosniff, 60),
             "ok": nosniff is not None and nosniff.strip().lower() == "nosniff"},
         "framing": {"x_frame_options": _clip(xfo, 60), "frame_ancestors": frame_ancestors,
-                    "ok": xfo_ok or frame_ancestors},
+                    "ok": framing_ok},
         "referrer_policy": {"present": referrer is not None, "value": _clip(referrer, 120),
                             "ok": effective is not None and effective != "unsafe-url"},
         "permissions_policy": {"present": "permissions-policy" in low,
@@ -880,7 +936,8 @@ def _tls_findings(tls: dict, redirects: dict) -> list[dict]:
                             {"host": tls["host"], "san": tls.get("san", [])[:10], **verify}))
     if not tls["verified"] and not (expired or not_yet or mismatch):
         out.append(_finding("tls-cert-not-trusted", "High",
-                            "The certificate chain did not verify against the system trust store.",
+                            "The certificate chain did not verify against the trusted root "
+                            "certificates (system store, plus certifi's bundle when installed).",
                             verify))
     days = tls.get("days_until_expiry")
     if not expired and days is not None and 0 <= days <= EXPIRY_WARN_DAYS:
@@ -919,7 +976,8 @@ def _header_findings(headers: dict) -> list[dict]:
     elif https and not hsts["max_age"]:
         out.append(_finding("hsts-disabled", "Medium",
                             "The Strict-Transport-Security header has no effect because max-age "
-                            "is missing or zero.", {"value": hsts["value"]}))
+                            "is missing, invalid or zero, or the header is invalid.",
+                            {"value": hsts["value"], "issues": hsts["issues"]}))
     elif https and hsts["issues"]:
         out.append(_finding("hsts-weak", "Low", "The Strict-Transport-Security header is weak.",
                             {"value": hsts["value"], "issues": hsts["issues"]}))
@@ -941,8 +999,7 @@ def _header_findings(headers: dict) -> list[dict]:
     framing = headers["framing"]
     if not framing["ok"]:
         out.append(_finding("clickjacking-protection-missing", "Low",
-                            "Neither X-Frame-Options nor a CSP frame-ancestors directive limits "
-                            "framing of the page.",
+                            "The effective response headers do not restrict framing to specific origins.",
                             {"x_frame_options": framing["x_frame_options"]}))
     referrer = headers["referrer_policy"]
     if not referrer["present"]:

@@ -29,6 +29,18 @@ import url_safety  # noqa: E402
 URL = "https://site.example/"
 
 
+@pytest.fixture(autouse=True)
+def _browser_launch_environment(monkeypatch):
+    """The fake browser launches the same for any user, proxy or opt-out."""
+    import browser_proxy
+
+    monkeypatch.setattr(browser_proxy.os, "geteuid", lambda: 1000, raising=False)
+    monkeypatch.setattr(url_safety.requests.utils, "getproxies", lambda: {})
+    monkeypatch.delenv(browser_proxy.NO_SANDBOX_ENV, raising=False)
+    monkeypatch.delenv(browser_proxy.REQUIRE_SANDBOX_ENV, raising=False)
+    monkeypatch.setattr(browser_proxy, "_warned_reasons", set())
+
+
 class FakeRoot:
     """The locator the page-side steps run through; every call carries a timeout."""
 
@@ -197,6 +209,7 @@ class FakeManager:
 
 def _capture(monkeypatch, page, **kwargs):
     monkeypatch.setattr(cs, "validate_url_strict", lambda url: (url, "93.184.216.34"))
+    monkeypatch.setattr(cs, "require_public_page", lambda page: None)
     monkeypatch.setattr(cs, "sync_playwright", lambda: FakeManager(page))
     return cs.capture_screenshot(URL, "/out/shot.png", **kwargs)
 
@@ -749,6 +762,7 @@ def test_cli_json_says_when_the_scroll_timed_out(tmp_path, monkeypatch, capsys) 
     monkeypatch.chdir(tmp_path)
     page = FakePage(hang="scroll_to")
     monkeypatch.setattr(cs, "validate_url_strict", lambda url: (url, "93.184.216.34"))
+    monkeypatch.setattr(cs, "require_public_page", lambda page: None)
     monkeypatch.setattr(cs, "sync_playwright", lambda: FakeManager(page))
     monkeypatch.setattr(sys, "argv", ["capture_screenshot.py", URL, "--full", "--json"])
     cs.main()
@@ -759,3 +773,167 @@ def test_cli_json_says_when_the_scroll_timed_out(tmp_path, monkeypatch, capsys) 
     assert capture["success"] is True  # the picture was still taken
     assert "scroll-through timed out" in captured.err
     assert page.names()[-1] == "screenshot"
+
+
+# ---------------------------------------------------------------------------
+# What a finished navigation may be photographed as (browser egress guard)
+# ---------------------------------------------------------------------------
+
+
+def _capture_checking_the_page(monkeypatch, page, **kwargs):
+    """Like _capture, with the real require_public_page."""
+    import browser_proxy
+
+    monkeypatch.setattr(url_safety.requests.utils, "getproxies", lambda: {})
+    monkeypatch.delenv(browser_proxy.NO_SANDBOX_ENV, raising=False)
+    monkeypatch.setattr(cs, "validate_url_strict", lambda url: (url, "93.184.216.34"))
+    monkeypatch.setattr(cs, "sync_playwright", lambda: FakeManager(page))
+    return cs.capture_screenshot(URL, "/out/shot.png", **kwargs)
+
+
+@pytest.mark.parametrize("url", ["about:blank", "chrome-error://chromewebdata/"])
+def test_a_page_that_never_loaded_is_an_error_not_a_picture(monkeypatch, url) -> None:
+    page = FakePage()
+    page.url = url
+    result = _capture_checking_the_page(monkeypatch, page)
+    assert result["success"] is False
+    assert result["error"].startswith("Page did not load: ")
+    assert "Invalid URL scheme" not in result["error"]
+    assert "screenshot" not in page.names()
+
+
+@pytest.mark.parametrize("url", ["http://127.0.0.1:9000/", "http://10.0.0.5/", "file:///etc/passwd"])
+def test_a_page_on_a_non_public_address_is_never_photographed(monkeypatch, url) -> None:
+    page = FakePage()
+    page.url = url
+    result = _capture_checking_the_page(monkeypatch, page)
+    assert result["success"] is False
+    assert result["error"].startswith("url_safety: ")
+    assert "screenshot" not in page.names()
+
+
+def test_a_page_that_navigates_away_after_load_is_not_photographed(monkeypatch) -> None:
+    """Page scripts can navigate after the load. The guard refuses the new
+    destination, and the picture must not be of that refusal."""
+    import browser_proxy
+
+    monkeypatch.setattr(
+        browser_proxy, "_destination", lambda url: ("93.184.216.34", "site.example", 443)
+        if url == URL else (_ for _ in ()).throw(url_safety.URLSafetyError("refused")),
+    )
+
+    class Wanderer(FakePage):
+        url = URL
+
+        def wait_for_timeout(self, ms):
+            super().wait_for_timeout(ms)
+            self.url = "http://127.0.0.1:9000/"
+
+    page = Wanderer()
+    result = _capture_checking_the_page(monkeypatch, page)
+    assert result["success"] is False
+    assert result["error"].startswith("url_safety: ")
+    assert page.names() == ["goto", "wait"]
+
+
+SANDBOX_LOG = "[pid] zygote_host_impl_linux.cc(128)] No usable sandbox! If you are running on Ubuntu"
+
+
+def _sandbox_mode_manager(page, mode, launches):
+    """A FakeManager whose sandboxed launch fails in 'fallback' mode."""
+    fake = FakeManager(page)
+    real_launch = fake.playwright.chromium.launch
+
+    def launch(**kwargs):
+        launches.append(kwargs["chromium_sandbox"])
+        if mode == "fallback" and kwargs["chromium_sandbox"]:
+            raise RuntimeError(SANDBOX_LOG)
+        return real_launch(**kwargs)
+
+    fake.playwright.chromium.launch = launch
+    return fake
+
+
+@pytest.mark.parametrize(
+    "mode,sandbox,per_capture,warning",
+    [
+        ("sandboxed", True, [True], ""),
+        ("fallback", False, [True, False], "sandbox is unavailable on this system"),
+        ("opt_out", False, [False], "disabled by CLAUDE_SEO_CHROMIUM_NO_SANDBOX"),
+    ],
+)
+def test_cli_json_says_whether_chromium_was_sandboxed(
+    tmp_path, monkeypatch, capsys, mode, sandbox, per_capture, warning
+) -> None:
+    import browser_proxy
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("USERPROFILE", str(tmp_path))
+    monkeypatch.chdir(tmp_path)
+    if mode == "opt_out":
+        monkeypatch.setenv(browser_proxy.NO_SANDBOX_ENV, "1")
+    launches: list[bool] = []
+    monkeypatch.setattr(cs, "validate_url_strict", lambda url: (url, "93.184.216.34"))
+    monkeypatch.setattr(cs, "require_public_page", lambda page: None)
+    monkeypatch.setattr(
+        cs, "sync_playwright", lambda: _sandbox_mode_manager(FakePage(), mode, launches)
+    )
+    monkeypatch.setattr(sys, "argv", ["capture_screenshot.py", URL, "--all", "--json"])
+    cs.main()
+    captured = capsys.readouterr()
+    captures = json.loads(captured.out)["captures"]  # stdout is JSON only
+    assert len(captures) == len(cs.VIEWPORTS)
+    assert all(capture["sandbox"] is sandbox for capture in captures)
+    assert all(capture["success"] for capture in captures)
+    assert launches == per_capture * len(cs.VIEWPORTS)
+    # One warning for the whole run, on stderr.
+    assert captured.err.count("claude-seo warning") == (1 if warning else 0)
+    assert warning in captured.err
+
+
+def test_capture_error_after_launch_keeps_the_sandbox_state(monkeypatch, capsys) -> None:
+    """A page error that quotes Chromium's sandbox message is not a launch
+    failure: no relaunch, no fallback, and the result still says sandboxed."""
+
+    class Crasher(FakePage):
+        def goto(self, url, **kwargs):
+            raise RuntimeError("Page.goto: Target crashed\n" + SANDBOX_LOG)
+
+    launches: list[bool] = []
+    monkeypatch.setattr(cs, "validate_url_strict", lambda url: (url, "93.184.216.34"))
+    monkeypatch.setattr(
+        cs, "sync_playwright", lambda: _sandbox_mode_manager(Crasher(), "sandboxed", launches)
+    )
+    result = cs.capture_screenshot(URL, "/out/shot.png")
+    assert result["success"] is False
+    assert result["error"].startswith("Page.goto: Target crashed")
+    assert launches == [True]
+    assert result["sandbox"] is True
+    assert capsys.readouterr().err == ""
+
+
+def test_capture_as_root_falls_back_and_says_so(monkeypatch, capsys) -> None:
+    import browser_proxy
+
+    monkeypatch.setattr(browser_proxy.os, "geteuid", lambda: 0, raising=False)
+    page = FakePage()
+    page.url = URL
+    monkeypatch.setattr(cs, "require_public_page", lambda page: None)
+    result = _capture_checking_the_page(monkeypatch, page)
+    assert result["success"] is True
+    assert result["sandbox"] is False
+    assert "a browser exploit would run as root" in capsys.readouterr().err
+
+
+def test_capture_in_strict_mode_reports_the_sandbox_failure(monkeypatch) -> None:
+    import browser_proxy
+
+    monkeypatch.setenv(browser_proxy.REQUIRE_SANDBOX_ENV, "1")
+    monkeypatch.setattr(browser_proxy.os, "geteuid", lambda: 0, raising=False)
+    page = FakePage()
+    result = _capture_checking_the_page(monkeypatch, page)
+    assert result["success"] is False
+    assert "CLAUDE_SEO_CHROMIUM_REQUIRE_SANDBOX" in result["error"]
+    assert "CLAUDE_SEO_CHROMIUM_NO_SANDBOX=1" in result["error"]
+    assert result["sandbox"] is None  # no browser was launched
+    assert page.calls == []
